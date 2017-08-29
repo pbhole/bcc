@@ -33,7 +33,7 @@ BLoader::~BLoader() {
 }
 
 int BLoader::parse(llvm::Module *mod, const string &filename, const string &proto_filename,
-                   TableStorage &ts, const string &id) {
+                   TableStorage &ts, const std::string &id) {
   int rc;
 
   proto_parser_ = make_unique<ebpf::cc::Parser>(proto_filename);
