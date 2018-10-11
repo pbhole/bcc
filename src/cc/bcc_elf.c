@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -26,21 +27,29 @@
 
 #include <gelf.h>
 #include "bcc_elf.h"
+#include "bcc_proc.h"
 #include "bcc_syms.h"
 
 #define NT_STAPSDT 3
 #define ELF_ST_TYPE(x) (((uint32_t) x) & 0xf)
 
-static int openelf(const char *path, Elf **elf_out, int *fd_out) {
+static int openelf_fd(int fd, Elf **elf_out) {
   if (elf_version(EV_CURRENT) == EV_NONE)
     return -1;
 
+  *elf_out = elf_begin(fd, ELF_C_READ, 0);
+  if (*elf_out == NULL)
+    return -1;
+
+  return 0;
+}
+
+static int openelf(const char *path, Elf **elf_out, int *fd_out) {
   *fd_out = open(path, O_RDONLY);
   if (*fd_out < 0)
     return -1;
 
-  *elf_out = elf_begin(*fd_out, ELF_C_READ, 0);
-  if (*elf_out == 0) {
+  if (openelf_fd(*fd_out, elf_out) == -1) {
     close(*fd_out);
     return -1;
   }
@@ -76,7 +85,7 @@ static const char *parse_stapsdt_note(struct bcc_elf_usdt *probe,
 
 static int do_note_segment(Elf_Scn *section, int elf_class,
                            bcc_elf_probecb callback, const char *binpath,
-                           void *payload) {
+                           uint64_t first_inst_offset, void *payload) {
   Elf_Data *data = NULL;
 
   while ((data = elf_getdata(section, data)) != 0) {
@@ -101,8 +110,14 @@ static int do_note_segment(Elf_Scn *section, int elf_class,
       desc = (const char *)data->d_buf + desc_off;
       desc_end = desc + hdr.n_descsz;
 
-      if (parse_stapsdt_note(&probe, desc, elf_class) == desc_end)
-        callback(binpath, &probe, payload);
+      if (parse_stapsdt_note(&probe, desc, elf_class) == desc_end) {
+        if (probe.pc < first_inst_offset)
+          fprintf(stderr,
+                  "WARNING: invalid address 0x%lx for probe (%s,%s) in binary %s\n",
+                  probe.pc, probe.provider, probe.name, binpath);
+        else
+          callback(binpath, &probe, payload);
+      }
     }
   }
   return 0;
@@ -113,9 +128,25 @@ static int listprobes(Elf *e, bcc_elf_probecb callback, const char *binpath,
   Elf_Scn *section = NULL;
   size_t stridx;
   int elf_class = gelf_getclass(e);
+  uint64_t first_inst_offset = 0;
 
   if (elf_getshdrstrndx(e, &stridx) != 0)
     return -1;
+
+  // Get the offset to the first instruction
+  while ((section = elf_nextscn(e, section)) != 0) {
+    GElf_Shdr header;
+
+    if (!gelf_getshdr(section, &header))
+      continue;
+
+    // The elf file section layout is based on increasing virtual address,
+    // getting the first section with SHF_EXECINSTR is enough.
+    if (header.sh_flags & SHF_EXECINSTR) {
+      first_inst_offset = header.sh_addr;
+      break;
+    }
+  }
 
   while ((section = elf_nextscn(e, section)) != 0) {
     GElf_Shdr header;
@@ -129,7 +160,8 @@ static int listprobes(Elf *e, bcc_elf_probecb callback, const char *binpath,
 
     name = elf_strptr(e, stridx, header.sh_name);
     if (name && !strcmp(name, ".note.stapsdt")) {
-      if (do_note_segment(section, elf_class, callback, binpath, payload) < 0)
+      if (do_note_segment(section, elf_class, callback, binpath,
+                          first_inst_offset, payload) < 0)
         return -1;
     }
   }
@@ -179,8 +211,6 @@ static int list_in_scn(Elf *e, Elf_Scn *section, size_t stridx, size_t symsize,
         continue;
 
       uint32_t st_type = ELF_ST_TYPE(sym.st_info);
-      if (sym.st_size == 0 && (st_type == STT_FUNC || st_type == STT_GNU_IFUNC))
-        continue;
       if (!(option->use_symbol_type & (1 << st_type)))
         continue;
 
@@ -347,8 +377,10 @@ static int verify_checksum(const char *file, unsigned int crc) {
   if (fd < 0)
     return 0;
 
-  if (fstat(fd, &st) < 0)
+  if (fstat(fd, &st) < 0) {
+    close(fd);
     return 0;
+  }
 
   buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (!buf) {
@@ -403,7 +435,7 @@ static char *find_debug_via_debuglink(Elf *e, const char *binpath,
 
 DONE:
   free(bindir);
-  if (check_crc && !verify_checksum(res, crc))
+  if (res && check_crc && !verify_checksum(res, crc))
     return NULL;
   return res;
 }
@@ -470,6 +502,41 @@ int bcc_elf_foreach_sym(const char *path, bcc_elf_symcb callback,
       path, callback, (struct bcc_symbol_option*)option, payload, 0);
 }
 
+int bcc_elf_get_text_scn_info(const char *path, uint64_t *addr,
+				   uint64_t *offset) {
+  Elf *e = NULL;
+  int fd = -1, err;
+  Elf_Scn *section = NULL;
+  GElf_Shdr header;
+  size_t stridx;
+  char *name;
+
+  if ((err = openelf(path, &e, &fd)) < 0 ||
+      (err = elf_getshdrstrndx(e, &stridx)) < 0)
+    goto exit;
+
+  err = -1;
+  while ((section = elf_nextscn(e, section)) != 0) {
+    if (!gelf_getshdr(section, &header))
+      continue;
+
+    name = elf_strptr(e, stridx, header.sh_name);
+    if (name && !strcmp(name, ".text")) {
+      *addr = (uint64_t)header.sh_addr;
+      *offset = (uint64_t)header.sh_offset;
+      err = 0;
+      break;
+    }
+  }
+
+exit:
+  if (e)
+    elf_end(e);
+  if (fd >= 0)
+    close(fd);
+  return err;
+}
+
 int bcc_elf_foreach_load_section(const char *path,
                                  bcc_elf_load_sectioncb callback,
                                  void *payload) {
@@ -530,6 +597,72 @@ int bcc_elf_is_exe(const char *path) {
 
 int bcc_elf_is_shared_obj(const char *path) {
   return bcc_elf_get_type(path) == ET_DYN;
+}
+
+int bcc_elf_is_vdso(const char *name) {
+  return strcmp(name, "[vdso]") == 0;
+}
+
+// -2: Failed
+// -1: Not initialized
+// >0: Initialized
+static int vdso_image_fd = -1;
+
+static int find_vdso(const char *name, uint64_t st, uint64_t en,
+                     uint64_t offset, bool enter_ns, void *payload) {
+  int fd;
+  char tmpfile[128];
+  if (!bcc_elf_is_vdso(name))
+    return 0;
+
+  void *image = malloc(en - st);
+  if (!image)
+    goto on_error;
+  memcpy(image, (void *)st, en - st);
+
+  snprintf(tmpfile, sizeof(tmpfile), "/tmp/bcc_%d_vdso_image_XXXXXX", getpid());
+  fd = mkostemp(tmpfile, O_CLOEXEC);
+  if (fd < 0) {
+    fprintf(stderr, "Unable to create temp file: %s\n", strerror(errno));
+    goto on_error;
+  }
+  // Unlink the file to avoid leaking
+  if (unlink(tmpfile) == -1)
+    fprintf(stderr, "Unlink %s failed: %s\n", tmpfile, strerror(errno));
+
+  if (write(fd, image, en - st) == -1) {
+    fprintf(stderr, "Failed to write to vDSO image: %s\n", strerror(errno));
+    close(fd);
+    goto on_error;
+  }
+  vdso_image_fd = fd;
+
+on_error:
+  if (image)
+    free(image);
+  // Always stop the iteration
+  return -1;
+}
+
+int bcc_elf_foreach_vdso_sym(bcc_elf_symcb callback, void *payload) {
+  Elf *elf;
+  static struct bcc_symbol_option default_option = {
+    .use_debug_file = 0,
+    .check_debug_file_crc = 0,
+    .use_symbol_type = (1 << STT_FUNC) | (1 << STT_GNU_IFUNC)
+  };
+
+  if (vdso_image_fd == -1) {
+    vdso_image_fd = -2;
+    bcc_procutils_each_module(getpid(), &find_vdso, NULL);
+  }
+  if (vdso_image_fd == -2)
+    return -1;
+
+  if (openelf_fd(vdso_image_fd, &elf) == -1)
+    return -1;
+
+  return listsymbols(elf, callback, payload, &default_option);
 }
 
 #if 0

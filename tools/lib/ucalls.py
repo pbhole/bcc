@@ -4,7 +4,7 @@
 # ucalls  Summarize method calls in high-level languages and/or system calls.
 #         For Linux, uses BCC, eBPF.
 #
-# USAGE: ucalls [-l {java,python,ruby,php}] [-h] [-T TOP] [-L] [-S] [-v] [-m]
+# USAGE: ucalls [-l {java,perl,php,python,ruby,tcl}] [-h] [-T TOP] [-L] [-S] [-v] [-m]
 #        pid [interval]
 #
 # Copyright 2016 Sasha Goldshtein
@@ -18,7 +18,7 @@ from bcc import BPF, USDT, utils
 from time import sleep
 import os
 
-languages = ["java", "python", "ruby", "php"]
+languages = ["java", "perl", "php", "python", "ruby", "tcl"]
 
 examples = """examples:
     ./ucalls -l java 185        # trace Java calls and print statistics on ^C
@@ -49,6 +49,8 @@ parser.add_argument("-v", "--verbose", action="store_true",
     help="verbose mode: print the BPF program (for debugging purposes)")
 parser.add_argument("-m", "--milliseconds", action="store_true",
     help="report times in milliseconds (default is microseconds)")
+parser.add_argument("--ebpf", action="store_true",
+    help=argparse.SUPPRESS)
 args = parser.parse_args()
 
 language = args.language
@@ -67,7 +69,20 @@ if language == "java":
     return_probe = "method__return"
     read_class = "bpf_usdt_readarg(2, ctx, &clazz);"
     read_method = "bpf_usdt_readarg(4, ctx, &method);"
-    extra_message = "If you do not see any results, make sure you ran java with option -XX:+ExtendedDTraceProbes"
+    extra_message = ("If you do not see any results, make sure you ran java"
+                     " with option -XX:+ExtendedDTraceProbes")
+elif language == "perl":
+    entry_probe = "sub__entry"
+    return_probe = "sub__return"
+    read_class = "bpf_usdt_readarg(2, ctx, &clazz);"    # filename really
+    read_method = "bpf_usdt_readarg(1, ctx, &method);"
+elif language == "php":
+    entry_probe = "function__entry"
+    return_probe = "function__return"
+    read_class = "bpf_usdt_readarg(4, ctx, &clazz);"
+    read_method = "bpf_usdt_readarg(1, ctx, &method);"
+    extra_message = ("If you do not see any results, make sure the environment"
+                     " variable USE_ZEND_DTRACE is set to 1")
 elif language == "python":
     entry_probe = "function__entry"
     return_probe = "function__return"
@@ -79,12 +94,12 @@ elif language == "ruby":
     return_probe = "method__return"
     read_class = "bpf_usdt_readarg(1, ctx, &clazz);"
     read_method = "bpf_usdt_readarg(2, ctx, &method);"
-elif language == "php":
-    entry_probe = "function__entry"
-    return_probe = "function__return"
-    read_class = "bpf_usdt_readarg(4, ctx, &clazz);"
+elif language == "tcl":
+    # TODO Also consider probe cmd__entry and cmd__return with same arguments
+    entry_probe = "proc__entry"
+    return_probe = "proc__return"
+    read_class = ""  # no class/file info available
     read_method = "bpf_usdt_readarg(1, ctx, &method);"
-    extra_message = "If you do not see any results, make sure the environment variable USE_ZEND_DTRACE is set to 1"
 elif not language or language == "none":
     if not args.syscalls:
         print("Nothing to do; use -S to trace syscalls.")
@@ -185,7 +200,7 @@ int trace_return(struct pt_regs *ctx) {
 #ifdef SYSCALLS
 int syscall_entry(struct pt_regs *ctx) {
     u64 pid = bpf_get_current_pid_tgid();
-    u64 *valp, ip = ctx->ip, val = 0;
+    u64 *valp, ip = PT_REGS_IP(ctx), val = 0;
     PID_FILTER
 #ifdef LATENCY
     struct syscall_entry_t data = {};
@@ -236,10 +251,12 @@ if language:
 else:
     usdt = None
 
-if args.verbose:
-    if usdt:
+if args.ebpf or args.verbose:
+    if args.verbose and usdt:
         print(usdt.get_text())
     print(program)
+    if args.ebpf:
+        exit()
 
 bpf = BPF(text=program, usdt_contexts=[usdt] if usdt else [])
 if args.syscalls:
@@ -253,11 +270,15 @@ if args.syscalls:
 def get_data():
     # Will be empty when no language was specified for tracing
     if args.latency:
-        data = list(map(lambda kv: (kv[0].clazz + "." + kv[0].method,
+        data = list(map(lambda kv: (kv[0].clazz.decode('utf-8', 'replace') \
+                                    + "." + \
+                                    kv[0].method.decode('utf-8', 'replace'),
                                    (kv[1].num_calls, kv[1].total_ns)),
                    bpf["times"].items()))
     else:
-        data = list(map(lambda kv: (kv[0].clazz + "." + kv[0].method,
+        data = list(map(lambda kv: (kv[0].clazz.decode('utf-8', 'replace') \
+                                    + "." + \
+                                    kv[0].method.decode('utf-8', 'replace'),
                                    (kv[1].value, 0)),
                    bpf["counts"].items()))
 

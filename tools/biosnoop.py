@@ -94,8 +94,9 @@ int trace_req_completion(struct pt_regs *ctx, struct request *req)
         data.len = req->__data_len;
         data.sector = req->__sector;
         bpf_probe_read(&data.name, sizeof(data.name), valp->name);
+        struct gendisk *rq_disk = req->rq_disk;
         bpf_probe_read(&data.disk_name, sizeof(data.disk_name),
-                       req->rq_disk->disk_name);
+                       rq_disk->disk_name);
     }
 
 /*
@@ -175,8 +176,8 @@ def print_event(cpu, data, size):
         delta = float(delta) + (event.ts - prev_ts)
 
     print("%-14.9f %-14.14s %-6s %-7s %-2s %-9s %-7s %7.2f" % (
-        delta / 1000000, event.name.decode(), event.pid,
-        event.disk_name.decode(), rwflg, val,
+        delta / 1000000, event.name.decode('utf-8', 'replace'), event.pid,
+        event.disk_name.decode('utf-8', 'replace'), rwflg, val,
         event.len, float(event.delta) / 1000000))
 
     prev_ts = event.ts
@@ -185,4 +186,4 @@ def print_event(cpu, data, size):
 # loop with callback to print_event
 b["events"].open_perf_buffer(print_event, page_cnt=64)
 while 1:
-    b.kprobe_poll()
+    b.perf_buffer_poll()

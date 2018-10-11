@@ -252,18 +252,18 @@ function PerfEventArray:_open_perf_buffer(cpu, callback, ctype, page_cnt, lost_c
   local _lost_cb = nil
   if lost_cb then
     _lost_cb = ffi.cast("perf_reader_lost_cb",
-      function (lost)
-        lost_cb(lost)
+      function (cookie, lost)
+        lost_cb(cookie, lost)
       end)
   end
 
   -- default to 8 pages per buffer
-  local reader = libbcc.bpf_open_perf_buffer(_cb, nil, _lost_cb, -1, cpu, page_cnt or 8)
+  local reader = libbcc.bpf_open_perf_buffer(_cb, _lost_cb, nil, -1, cpu, page_cnt or 8)
   assert(reader, "failed to open perf buffer")
 
   local fd = libbcc.perf_reader_fd(reader)
   self:set(cpu, fd)
-  self.bpf:probe_store("kprobe", _perf_id(self.map_id, cpu), reader)
+  self.bpf:perf_buffer_store(_perf_id(self.map_id, cpu), reader)
   self._callbacks[cpu] = _cb
 end
 

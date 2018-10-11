@@ -99,10 +99,14 @@ class MyMemoryManager : public SectionMemoryManager {
   map<string, tuple<uint8_t *, uintptr_t>> *sections_;
 };
 
-BPFModule::BPFModule(unsigned flags, TableStorage *ts)
+BPFModule::BPFModule(unsigned flags, TableStorage *ts, bool rw_engine_enabled,
+                     const std::string &maps_ns)
     : flags_(flags),
+      rw_engine_enabled_(rw_engine_enabled),
+      used_b_loader_(false),
       ctx_(new LLVMContext),
       id_(std::to_string((uintptr_t)this)),
+      maps_ns_(maps_ns),
       ts_(ts) {
   InitializeNativeTarget();
   InitializeNativeTargetAsmPrinter();
@@ -111,6 +115,7 @@ BPFModule::BPFModule(unsigned flags, TableStorage *ts)
   LLVMInitializeBPFTargetInfo();
   LLVMInitializeBPFAsmPrinter();
 #if LLVM_MAJOR_VERSION >= 6
+  LLVMInitializeBPFAsmParser();
   if (flags & DEBUG_SOURCE)
     LLVMInitializeBPFDisassembler();
 #endif
@@ -135,6 +140,11 @@ BPFModule::~BPFModule() {
     v->leaf_sscanf = unimplemented_sscanf;
     v->key_snprintf = unimplemented_snprintf;
     v->leaf_snprintf = unimplemented_snprintf;
+  }
+
+  if (!rw_engine_enabled_) {
+    for (auto section : sections_)
+      delete[] get<0>(section.second);
   }
 
   engine_.reset();
@@ -454,7 +464,7 @@ unique_ptr<ExecutionEngine> BPFModule::finalize_rw(unique_ptr<Module> m) {
   string err;
   EngineBuilder builder(move(m));
   builder.setErrorStr(&err);
-  builder.setUseOrcMCJITReplacement(true);
+  builder.setUseOrcMCJITReplacement(false);
   auto engine = unique_ptr<ExecutionEngine>(builder.create());
   if (!engine)
     fprintf(stderr, "Could not create ExecutionEngine: %s\n", err.c_str());
@@ -463,9 +473,9 @@ unique_ptr<ExecutionEngine> BPFModule::finalize_rw(unique_ptr<Module> m) {
 
 // load an entire c file as a module
 int BPFModule::load_cfile(const string &file, bool in_memory, const char *cflags[], int ncflags) {
-  clang_loader_ = ebpf::make_unique<ClangLoader>(&*ctx_, flags_);
-  if (clang_loader_->parse(&mod_, *ts_, file, in_memory, cflags, ncflags, id_,
-                           *func_src_, mod_src_))
+  ClangLoader clang_loader(&*ctx_, flags_);
+  if (clang_loader.parse(&mod_, *ts_, file, in_memory, cflags, ncflags, id_,
+                         *func_src_, mod_src_, maps_ns_))
     return -1;
   return 0;
 }
@@ -476,11 +486,25 @@ int BPFModule::load_cfile(const string &file, bool in_memory, const char *cflags
 // Load in a pre-built list of functions into the initial Module object, then
 // build an ExecutionEngine.
 int BPFModule::load_includes(const string &text) {
-  clang_loader_ = ebpf::make_unique<ClangLoader>(&*ctx_, flags_);
-  if (clang_loader_->parse(&mod_, *ts_, text, true, nullptr, 0, "", *func_src_,
-                           mod_src_))
+  ClangLoader clang_loader(&*ctx_, flags_);
+  if (clang_loader.parse(&mod_, *ts_, text, true, nullptr, 0, "", *func_src_,
+                         mod_src_, ""))
     return -1;
   return 0;
+}
+
+void BPFModule::annotate_light() {
+  for (auto fn = mod_->getFunctionList().begin(); fn != mod_->getFunctionList().end(); ++fn)
+    if (!fn->hasFnAttribute(Attribute::NoInline))
+      fn->addFnAttr(Attribute::AlwaysInline);
+
+  size_t id = 0;
+  Path path({id_});
+  for (auto it = ts_->lower_bound(path), up = ts_->upper_bound(path); it != up; ++it) {
+    TableDesc &table = it->second;
+    tables_.push_back(&it->second);
+    table_names_[table.name] = id++;
+  }
 }
 
 int BPFModule::annotate() {
@@ -528,6 +552,8 @@ int BPFModule::annotate() {
 }
 
 StatusTuple BPFModule::sscanf(string fn_name, const char *str, void *val) {
+  if (!rw_engine_enabled_)
+    return StatusTuple(-1, "rw_engine not enabled");
   auto fn =
       (int (*)(const char *, void *))rw_engine_->getFunctionAddress(fn_name);
   if (!fn)
@@ -540,6 +566,8 @@ StatusTuple BPFModule::sscanf(string fn_name, const char *str, void *val) {
 
 StatusTuple BPFModule::snprintf(string fn_name, char *str, size_t sz,
                                 const void *val) {
+  if (!rw_engine_enabled_)
+    return StatusTuple(-1, "rw_engine not enabled");
   auto fn = (int (*)(char *, size_t,
                      const void *))rw_engine_->getFunctionAddress(fn_name);
   if (!fn)
@@ -586,16 +614,18 @@ int BPFModule::run_pass_manager(Module &mod) {
 
 int BPFModule::finalize() {
   Module *mod = &*mod_;
+  std::map<std::string, std::tuple<uint8_t *, uintptr_t>> tmp_sections,
+      *sections_p;
 
-  mod->setDataLayout("e-m:e-p:64:64-i64:64-n32:64-S128");
   mod->setTargetTriple("bpf-pc-linux");
+  sections_p = rw_engine_enabled_ ? &sections_ : &tmp_sections;
 
   string err;
   EngineBuilder builder(move(mod_));
   builder.setErrorStr(&err);
-  builder.setMCJITMemoryManager(ebpf::make_unique<MyMemoryManager>(&sections_));
+  builder.setMCJITMemoryManager(ebpf::make_unique<MyMemoryManager>(sections_p));
   builder.setMArch("bpf");
-  builder.setUseOrcMCJITReplacement(true);
+  builder.setUseOrcMCJITReplacement(false);
   engine_ = unique_ptr<ExecutionEngine>(builder.create());
   if (!engine_) {
     fprintf(stderr, "Could not create ExecutionEngine: %s\n", err.c_str());
@@ -610,15 +640,34 @@ int BPFModule::finalize() {
 
   engine_->finalizeObject();
 
+  if (flags_ & DEBUG_SOURCE) {
+    SourceDebugger src_debugger(mod, *sections_p, FN_PREFIX, mod_src_,
+                                src_dbg_fmap_);
+    src_debugger.dump();
+  }
+
+  if (!rw_engine_enabled_) {
+    // Setup sections_ correctly and then free llvm internal memory
+    for (auto section : tmp_sections) {
+      auto fname = section.first;
+      uintptr_t size = get<1>(section.second);
+      uint8_t *tmp_p = NULL;
+      // Only copy data for non-map sections
+      if (strncmp("maps/", section.first.c_str(), 5)) {
+        uint8_t *addr = get<0>(section.second);
+        tmp_p = new uint8_t[size];
+        memcpy(tmp_p, addr, size);
+      }
+      sections_[fname] = make_tuple(tmp_p, size);
+    }
+    engine_.reset();
+    ctx_.reset();
+  }
+
   // give functions an id
   for (auto section : sections_)
     if (!strncmp(FN_PREFIX.c_str(), section.first.c_str(), FN_PREFIX.size()))
       function_names_.push_back(section.first);
-
-  if (flags_ & DEBUG_SOURCE) {
-    SourceDebugger src_debugger(mod, sections_, FN_PREFIX, mod_src_);
-    src_debugger.dump();
-  }
 
   return 0;
 }
@@ -690,7 +739,7 @@ int BPFModule::annotate_prog_tag(const string &name, int prog_fd,
 
   ::snprintf(buf, sizeof(buf), BCC_PROG_TAG_DIR "/bpf_prog_%llx/%s.c",
              tag1, name.data());
-  FileDesc fd(open(buf, O_CREAT | O_WRONLY | O_TRUNC,  0644));
+  FileDesc fd(open(buf, O_CREAT | O_WRONLY | O_TRUNC, 0644));
   if (fd < 0) {
     fprintf(stderr, "cannot create %s\n", buf);
     return -1;
@@ -701,7 +750,7 @@ int BPFModule::annotate_prog_tag(const string &name, int prog_fd,
 
   ::snprintf(buf, sizeof(buf), BCC_PROG_TAG_DIR "/bpf_prog_%llx/%s.rewritten.c",
              tag1, name.data());
-  fd = open(buf, O_CREAT | O_WRONLY | O_TRUNC,  0644);
+  fd = open(buf, O_CREAT | O_WRONLY | O_TRUNC, 0644);
   if (fd < 0) {
     fprintf(stderr, "cannot create %s\n", buf);
     return -1;
@@ -709,6 +758,20 @@ int BPFModule::annotate_prog_tag(const string &name, int prog_fd,
 
   src = function_source_rewritten(name);
   write(fd, src, strlen(src));
+
+  if (!src_dbg_fmap_[name].empty()) {
+    ::snprintf(buf, sizeof(buf), BCC_PROG_TAG_DIR "/bpf_prog_%llx/%s.dis.txt",
+               tag1, name.data());
+    fd = open(buf, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+      fprintf(stderr, "cannot create %s\n", buf);
+      return -1;
+    }
+
+    const char *src = src_dbg_fmap_[name].c_str();
+    write(fd, src, strlen(src));
+  }
+
   return 0;
 }
 
@@ -800,7 +863,7 @@ const char * BPFModule::table_name(size_t id) const {
 }
 
 const char * BPFModule::table_key_desc(size_t id) const {
-  if (b_loader_) return nullptr;
+  if (used_b_loader_) return nullptr;
   if (id >= tables_.size())
     return nullptr;
   return tables_[id]->key_desc.c_str();
@@ -811,7 +874,7 @@ const char * BPFModule::table_key_desc(const string &name) const {
 }
 
 const char * BPFModule::table_leaf_desc(size_t id) const {
-  if (b_loader_) return nullptr;
+  if (used_b_loader_) return nullptr;
   if (id >= tables_.size())
     return nullptr;
   return tables_[id]->leaf_desc.c_str();
@@ -916,11 +979,17 @@ int BPFModule::load_b(const string &filename, const string &proto_filename) {
   if (int rc = load_includes(helpers_h->second))
     return rc;
 
-  b_loader_.reset(new BLoader(flags_));
-  if (int rc = b_loader_->parse(&*mod_, filename, proto_filename, *ts_, id_))
+  BLoader b_loader(flags_);
+  used_b_loader_ = true;
+  if (int rc = b_loader.parse(&*mod_, filename, proto_filename, *ts_, id_,
+                              maps_ns_))
     return rc;
-  if (int rc = annotate())
-    return rc;
+  if (rw_engine_enabled_) {
+    if (int rc = annotate())
+      return rc;
+  } else {
+    annotate_light();
+  }
   if (int rc = finalize())
     return rc;
   return 0;
@@ -938,8 +1007,12 @@ int BPFModule::load_c(const string &filename, const char *cflags[], int ncflags)
   }
   if (int rc = load_cfile(filename, false, cflags, ncflags))
     return rc;
-  if (int rc = annotate())
-    return rc;
+  if (rw_engine_enabled_) {
+    if (int rc = annotate())
+      return rc;
+  } else {
+    annotate_light();
+  }
   if (int rc = finalize())
     return rc;
   return 0;
@@ -953,8 +1026,12 @@ int BPFModule::load_string(const string &text, const char *cflags[], int ncflags
   }
   if (int rc = load_cfile(text, true, cflags, ncflags))
     return rc;
-  if (int rc = annotate())
-    return rc;
+  if (rw_engine_enabled_) {
+    if (int rc = annotate())
+      return rc;
+  } else {
+    annotate_light();
+  }
 
   if (int rc = finalize())
     return rc;
