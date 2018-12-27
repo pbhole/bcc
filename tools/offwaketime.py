@@ -277,11 +277,13 @@ if not folded:
     else:
         print("... Hit Ctrl-C to end.")
 
-# as cleanup can take many seconds, trap Ctrl-C:
-# print a newline for folded output on Ctrl-C
-signal.signal(signal.SIGINT, signal_ignore)
+try:
+    sleep(duration)
+except KeyboardInterrupt:
+    # as cleanup can take many seconds, trap Ctrl-C:
+    # print a newline for folded output on Ctrl-C
+    signal.signal(signal.SIGINT, signal_ignore)
 
-sleep(duration)
 
 if not folded:
     print()
@@ -340,7 +342,7 @@ for k, v in sorted(counts.items(), key=lambda counts: counts[1].value):
         if not args.kernel_stacks_only:
             line.extend(["-"] if (need_delimiter and k.w_u_stack_id > 0 and k.w_k_stack_id > 0) else [])
             if stack_id_err(k.w_u_stack_id):
-                line.extend("[Missed User Stack]")
+                line.append("[Missed User Stack]")
             else:
                 line.extend([b.sym(addr, k.w_tgid)
                     for addr in reversed(list(waker_user_stack))])

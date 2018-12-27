@@ -15,7 +15,8 @@ add_definitions(${LLVM_DEFINITIONS})
 configure_file(libbcc.pc.in ${CMAKE_CURRENT_BINARY_DIR}/libbcc.pc @ONLY)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -DBCC_PROG_TAG_DIR='\"${BCC_PROG_TAG_DIR}\"'")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC -Wno-unused-result")
 
 string(REGEX MATCH "^([0-9]+).*" _ ${LLVM_PACKAGE_VERSION})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_MAJOR_VERSION=${CMAKE_MATCH_1}")
@@ -31,6 +32,12 @@ set_target_properties(bpf-shared PROPERTIES OUTPUT_NAME bpf)
 set(bcc_common_sources bpf_common.cc bpf_module.cc exported_files.cc)
 if (${LLVM_PACKAGE_VERSION} VERSION_EQUAL 6 OR ${LLVM_PACKAGE_VERSION} VERSION_GREATER 6)
   set(bcc_common_sources ${bcc_common_sources} bcc_debug.cc)
+endif()
+
+if(ENABLE_LLVM_NATIVECODEGEN)
+set(bcc_common_sources ${bcc_common_sources} bpf_module_rw_engine.cc)
+else()
+set(bcc_common_sources ${bcc_common_sources} bpf_module_rw_engine_disabled.cc)
 endif()
 
 set(bcc_table_sources table_storage.cc shared_table.cc bpffs_table.cc json_map_decl_visitor.cc)
