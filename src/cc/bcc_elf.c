@@ -863,7 +863,7 @@ int bcc_free_memory() {
     int path_start = 0, path_end = 0;
     unsigned int devmajor, devminor;
     char perms[8];
-    if (sscanf(line, "%lx-%lx %7s %lx %u:%u %lu %n%*[^\n]%n",
+    if (sscanf(line, "%lx-%lx %7s %lx %x:%x %lu %n%*[^\n]%n",
                &addr_start, &addr_end, perms, &offset,
                &devmajor, &devminor, &inode,
                &path_start, &path_end) < 7)
@@ -880,6 +880,20 @@ int bcc_free_memory() {
   fclose(maps);
   free(line);
   return err;
+}
+
+int bcc_elf_get_buildid(const char *path, char *buildid)
+{
+  Elf *e;
+  int fd;
+
+  if (openelf(path, &e, &fd) < 0)
+    return -1;
+
+  if (!find_buildid(e, buildid))
+    return -1;
+
+  return 0;
 }
 
 #if 0

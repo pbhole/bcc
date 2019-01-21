@@ -317,6 +317,15 @@ class TableBase(MutableMapping):
             tmp = {}
             f1 = self.Key._fields_[0][0]
             f2 = self.Key._fields_[1][0]
+
+            # The above code assumes that self.Key._fields_[1][0] holds the
+            # slot. But a padding member may have been inserted here, which
+            # breaks the assumption and leads to chaos.
+            # TODO: this is a quick fix. Fixing/working around in the BCC
+            # internal library is the right thing to do.
+            if f2 == '__pad_1' and len(self.Key._fields_) == 3:
+                f2 = self.Key._fields_[2][0]
+
             for k, v in self.items():
                 bucket = getattr(k, f1)
                 if bucket_fn:
@@ -736,15 +745,20 @@ class LpmTrie(TableBase):
 
 class StackTrace(TableBase):
     MAX_DEPTH = 127
+    BPF_F_STACK_BUILD_ID = (1<<5)
+    BPF_STACK_BUILD_ID_EMPTY =  0 #can't get stacktrace
+    BPF_STACK_BUILD_ID_VALID = 1 #valid build-id,ip
+    BPF_STACK_BUILD_ID_IP = 2 #fallback to ip
 
     def __init__(self, *args, **kwargs):
         super(StackTrace, self).__init__(*args, **kwargs)
 
     class StackWalker(object):
-        def __init__(self, stack, resolve=None):
+        def __init__(self, stack, flags, resolve=None):
             self.stack = stack
             self.n = -1
             self.resolve = resolve
+            self.flags = flags
 
         def __iter__(self):
             return self
@@ -757,14 +771,21 @@ class StackTrace(TableBase):
             if self.n == StackTrace.MAX_DEPTH:
                 raise StopIteration()
 
-            addr = self.stack.ip[self.n]
+            if self.flags & StackTrace.BPF_F_STACK_BUILD_ID:
+              addr = self.stack.trace[self.n]
+              if addr.status == StackTrace.BPF_STACK_BUILD_ID_IP or \
+                 addr.status == StackTrace.BPF_STACK_BUILD_ID_EMPTY:
+                  raise StopIteration()
+            else:
+              addr = self.stack.ip[self.n]
+
             if addr == 0 :
                 raise StopIteration()
 
             return self.resolve(addr) if self.resolve else addr
 
     def walk(self, stack_id, resolve=None):
-        return StackTrace.StackWalker(self[self.Key(stack_id)], resolve)
+        return StackTrace.StackWalker(self[self.Key(stack_id)], self.flags, resolve)
 
     def __len__(self):
         i = 0

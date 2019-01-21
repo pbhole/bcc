@@ -35,6 +35,7 @@
 
 #include "common.h"
 #include "bcc_debug.h"
+#include "bcc_elf.h"
 #include "frontends/b/loader.h"
 #include "frontends/clang/loader.h"
 #include "frontends/clang/b_frontend_action.h"
@@ -89,7 +90,7 @@ class MyMemoryManager : public SectionMemoryManager {
 BPFModule::BPFModule(unsigned flags, TableStorage *ts, bool rw_engine_enabled,
                      const std::string &maps_ns)
     : flags_(flags),
-      rw_engine_enabled_(rw_engine_enabled),
+      rw_engine_enabled_(rw_engine_enabled && bpf_module_rw_engine_enabled()),
       used_b_loader_(false),
       ctx_(new LLVMContext),
       id_(std::to_string((uintptr_t)this)),
@@ -139,6 +140,10 @@ BPFModule::~BPFModule() {
   func_src_.reset();
 
   ts_->DeletePrefix(Path({id_}));
+}
+
+int BPFModule::free_bcc_memory() {
+  return bcc_free_memory();
 }
 
 // load an entire c file as a module

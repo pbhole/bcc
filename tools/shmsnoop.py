@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # @lint-avoid-python-3-compatibility-imports
 #
 # shmsnoop Trace shm*() syscalls.
@@ -316,4 +316,7 @@ def print_event(cpu, data, size):
 b["events"].open_perf_buffer(print_event, page_cnt=64)
 start_time = datetime.now()
 while not args.duration or datetime.now() - start_time < args.duration:
-    b.perf_buffer_poll(timeout=1000)
+    try:
+        b.perf_buffer_poll(timeout=1000)
+    except KeyboardInterrupt:
+        exit()

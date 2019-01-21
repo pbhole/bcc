@@ -82,8 +82,8 @@ lib.bpf_open_raw_sock.restype = ct.c_int
 lib.bpf_open_raw_sock.argtypes = [ct.c_char_p]
 lib.bpf_attach_socket.restype = ct.c_int
 lib.bpf_attach_socket.argtypes = [ct.c_int, ct.c_int]
-lib.bpf_prog_load.restype = ct.c_int
-lib.bpf_prog_load.argtypes = [ct.c_int, ct.c_char_p, ct.c_void_p,
+lib.bcc_prog_load.restype = ct.c_int
+lib.bcc_prog_load.argtypes = [ct.c_int, ct.c_char_p, ct.c_void_p,
         ct.c_size_t, ct.c_char_p, ct.c_uint, ct.c_int, ct.c_char_p, ct.c_uint]
 _RAW_CB_TYPE = ct.CFUNCTYPE(None, ct.py_object, ct.c_void_p, ct.c_int)
 _LOST_CB_TYPE = ct.CFUNCTYPE(None, ct.py_object, ct.c_ulonglong)
@@ -133,6 +133,19 @@ class bcc_symbol(ct.Structure):
             ('offset', ct.c_ulonglong),
         ]
 
+class bcc_ip_offset_union(ct.Union):
+  _fields_ = [
+          ('offset', ct.c_uint64),
+          ('ip', ct.c_uint64)
+        ]
+
+class bcc_stacktrace_build_id(ct.Structure):
+    _fields_ = [
+            ('status', ct.c_uint32),
+            ('build_id',ct.c_ubyte*20),
+            ('u',bcc_ip_offset_union)
+         ]
+
 class bcc_symbol_option(ct.Structure):
     _fields_ = [
             ('use_debug_file', ct.c_int),
@@ -160,6 +173,18 @@ lib.bcc_symcache_new.argtypes = [ct.c_int, ct.POINTER(bcc_symbol_option)]
 
 lib.bcc_free_symcache.restype = ct.c_void_p
 lib.bcc_free_symcache.argtypes = [ct.c_void_p, ct.c_int]
+
+lib.bcc_buildsymcache_new.restype = ct.c_void_p
+lib.bcc_buildsymcache_new.argtypes = None
+
+lib.bcc_free_buildsymcache.restype = None
+lib.bcc_free_buildsymcache.argtypes = [ct.c_void_p]
+
+lib.bcc_buildsymcache_add_module.restype = ct.c_int
+lib.bcc_buildsymcache_add_module.argtypes = [ct.c_void_p, ct.c_char_p]
+
+lib.bcc_buildsymcache_resolve.restype = ct.c_int
+lib.bcc_buildsymcache_resolve.argtypes = [ct.c_void_p, ct.POINTER(bcc_stacktrace_build_id), ct.POINTER(bcc_symbol)]
 
 lib.bcc_symbol_free_demangle_name.restype = ct.c_void_p
 lib.bcc_symbol_free_demangle_name.argtypes = [ct.POINTER(bcc_symbol)]

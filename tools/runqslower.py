@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # @lint-avoid-python-3-compatibility-imports
 #
 # runqslower    Trace long process scheduling delays.
@@ -218,7 +218,7 @@ if min_us == 0:
 else:
     bpf_text = bpf_text.replace('FILTER_US', 'delta_us <= %s' % str(min_us))
 if args.pid:
-    bpf_text = bpf_text.replace('FILTER_PID', 'pid != %s' % pid)
+    bpf_text = bpf_text.replace('FILTER_PID', 'pid != %s' % args.pid)
 else:
     bpf_text = bpf_text.replace('FILTER_PID', '0')
 if debug or args.ebpf:
